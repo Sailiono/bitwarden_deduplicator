@@ -2,8 +2,11 @@ import pandas as pd
 import argparse
 import os
 import chardet
-import re
+from collections import OrderedDict
 from urllib.parse import urlparse
+
+KEY_COLUMNS = ['type', 'name', 'login_uri', 'login_username', 'login_password']
+
 
 def detect_encoding(file_path):
     """检测文件编码"""
@@ -11,6 +14,107 @@ def detect_encoding(file_path):
         raw_data = f.read()  # 读取整个文件以确保准确检测编码
         result = chardet.detect(raw_data)
     return result['encoding']
+
+
+def _normalized_value(value):
+    """将CSV中的空值统一为空字符串，便于稳定比较。"""
+    return '' if pd.isna(value) else value
+
+
+def _row_signature(row, columns):
+    """生成包含全部导出字段的行签名。"""
+    return tuple(_normalized_value(row[column]) for column in columns)
+
+
+def _merge_compatible_rows(rows, columns):
+    """
+    合并只存在“空值/非空值”差异的记录。
+
+    如果同一非键字段存在两个不同的非空值，则返回None，避免静默丢失数据。
+    """
+    merged = rows[0].copy()
+    for column in columns:
+        if column in KEY_COLUMNS:
+            continue
+
+        nonempty_values = []
+        for row in rows:
+            value = _normalized_value(row[column])
+            if value == '':
+                continue
+            if value not in nonempty_values:
+                nonempty_values.append(value)
+
+        if len(nonempty_values) > 1:
+            return None
+        if nonempty_values and _normalized_value(merged[column]) == '':
+            merged[column] = nonempty_values[0]
+
+    return merged
+
+
+def deduplicate_dataframe(df, domain_only=False):
+    """
+    安全去重DataFrame，返回(去重结果, 统计信息)。
+
+    候选键与原工具一致。整行相同的副本会删除；附加字段可以无损补全时
+    才会合并；如果备注、TOTP、自定义字段等存在冲突，则保留各个版本。
+    域名模式明确忽略login_uri差异，但不会忽略其他字段冲突。
+    """
+    groups = OrderedDict()
+    for index, row in df.iterrows():
+        uri_key = extract_domain(row['login_uri']) if domain_only else row['login_uri']
+        key = (
+            _normalized_value(row['type']),
+            _normalized_value(row['name']),
+            _normalized_value(uri_key),
+            _normalized_value(row['login_username']),
+            _normalized_value(row['login_password']),
+        )
+        groups.setdefault(key, []).append(index)
+
+    output_rows = []
+    stats = {
+        'candidate_duplicate_groups': 0,
+        'exact_duplicate_rows_removed': 0,
+        'compatible_groups_merged': 0,
+        'conflicting_groups_retained': 0,
+    }
+
+    for indexes in groups.values():
+        if len(indexes) > 1:
+            stats['candidate_duplicate_groups'] += 1
+
+        unique_rows = []
+        seen_signatures = set()
+        for index in indexes:
+            row = df.loc[index]
+            signature = _row_signature(row, list(df.columns))
+            if signature in seen_signatures:
+                stats['exact_duplicate_rows_removed'] += 1
+                continue
+            seen_signatures.add(signature)
+            unique_rows.append(row)
+
+        if len(unique_rows) == 1:
+            output_rows.append(unique_rows[0])
+            continue
+
+        merged = _merge_compatible_rows(unique_rows, list(df.columns))
+        if merged is None:
+            output_rows.extend(unique_rows)
+            stats['conflicting_groups_retained'] += 1
+        else:
+            output_rows.append(merged)
+            stats['compatible_groups_merged'] += 1
+
+    result = pd.DataFrame(
+        [row.to_dict() for row in output_rows],
+        columns=df.columns,
+    )
+    stats['rows_removed'] = len(df) - len(result)
+    return result, stats
+
 
 def deduplicate_bitwarden_csv(input_file, output_file=None, domain_only=False):
     """
@@ -28,14 +132,14 @@ def deduplicate_bitwarden_csv(input_file, output_file=None, domain_only=False):
     
     # 读取CSV文件
     try:
-        df = pd.read_csv(input_file, encoding=encoding)
+        df = pd.read_csv(input_file, encoding=encoding, keep_default_na=False)
         print(f"成功读取CSV文件，共有 {len(df)} 条记录")
     except Exception as e:
         print(f"读取文件时出错: {str(e)}")
         return
     
     # 检查必要的列是否存在
-    required_columns = ['type', 'name', 'login_uri', 'login_username', 'login_password']
+    required_columns = KEY_COLUMNS
     missing_columns = [col for col in required_columns if col not in df.columns]
     
     if missing_columns:
@@ -49,14 +153,10 @@ def deduplicate_bitwarden_csv(input_file, output_file=None, domain_only=False):
     # 如果选择了仅使用域名去重，则提取域名
     if domain_only:
         print("使用域名级别去重...")
-        # 创建域名列
-        df['domain'] = df['login_uri'].apply(extract_domain)
-        print(f"提取了 {len(df['domain'].unique())} 个不同的域名")
-        # 基于域名和其他字段去重
-        df_deduplicated = df.drop_duplicates(subset=['type', 'name', 'domain', 'login_username', 'login_password'])
-    else:
-        # 使用完整URI去重
-        df_deduplicated = df.drop_duplicates(subset=['type', 'name', 'login_uri', 'login_username', 'login_password'])
+        domains = df['login_uri'].apply(extract_domain)
+        print(f"提取了 {len(domains.unique())} 个不同的域名")
+
+    df_deduplicated, stats = deduplicate_dataframe(df, domain_only)
     
     # 记录去重后的数量
     after_count = len(df_deduplicated)
@@ -65,6 +165,9 @@ def deduplicate_bitwarden_csv(input_file, output_file=None, domain_only=False):
     print(f"去重前记录数: {before_count}")
     print(f"去重后记录数: {after_count}")
     print(f"移除了 {removed_count} 条重复记录")
+    print(f"其中整行完全重复: {stats['exact_duplicate_rows_removed']} 条")
+    print(f"安全补全后合并: {stats['compatible_groups_merged']} 组")
+    print(f"因字段冲突而保留: {stats['conflicting_groups_retained']} 组")
     
     # 如果没有指定输出文件，则使用原文件名加上"_deduplicated"
     if output_file is None:
@@ -73,6 +176,10 @@ def deduplicate_bitwarden_csv(input_file, output_file=None, domain_only=False):
     
     # 保存去重后的文件
     df_deduplicated.to_csv(output_file, index=False, encoding='utf-8-sig')
+    try:
+        os.chmod(output_file, 0o600)
+    except OSError as e:
+        print(f"警告: 无法将输出文件权限设置为仅当前用户可读写: {str(e)}")
     print(f"去重后的文件已保存至: {output_file}")
 
 def extract_domain(url):
